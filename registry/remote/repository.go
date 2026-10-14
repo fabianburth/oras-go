@@ -950,10 +950,9 @@ func (s *blobStore) completePushAfterInitialPost(ctx context.Context, req *http.
 		return fmt.Errorf("blob upload Location %q downgrades scheme from https", location.Host)
 	}
 	url := location.String()
-	// unwrap the content for optimizations of built-in types, so that a wrapped
-	// built-in reader (e.g. io.NopCloser(*bytes.Reader)) regains the stdlib
-	// auto-GetBody and a wrapped io.Seeker stays visible to the check below.
-	body := ioutil.UnwrapNopCloser(content)
+	// unwrap once; detect seekable/built-in on the unwrapped value.
+	unwrapped := ioutil.UnwrapNopCloser(content)
+	body := unwrapped
 	if _, ok := body.(io.ReadCloser); ok {
 		// undo unwrap if the nopCloser is intended.
 		body = content
@@ -972,13 +971,13 @@ func (s *blobStore) completePushAfterInitialPost(ctx context.Context, req *http.
 	// resend the body on a redirect or an HTTP/2 connection recycle, and a
 	// retrying RoundTripper relies on it to resend after a failed attempt.
 	if req.GetBody == nil {
-		if seeker, ok := body.(io.Seeker); ok {
+		if seeker, ok := unwrapped.(io.Seeker); ok {
 			if start, err := seeker.Seek(0, io.SeekCurrent); err == nil {
 				req.GetBody = func() (io.ReadCloser, error) {
 					if _, err := seeker.Seek(start, io.SeekStart); err != nil {
 						return nil, err
 					}
-					return io.NopCloser(body), nil
+					return io.NopCloser(unwrapped), nil
 				}
 			}
 		}
