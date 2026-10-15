@@ -28,10 +28,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -8878,6 +8880,10 @@ func Test_BlobStore_Push_GetBody(t *testing.T) {
 // net/http does not retry on its own; the retry transport rewinds via
 // Request.GetBody over a fresh connection. The source reader is seekable but
 // not a built-in, so GetBody comes from the fix, not net/http.
+//
+// It runs over both a non-closer seekable reader and a real *os.File: the file
+// case is an io.ReadCloser, so GetBody must shield it from the transport's
+// per-attempt Body.Close() or the retry would seek a closed file.
 func Test_BlobStore_Push_RetriesSeekableBody(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("a reset surfaces as WSAECONNRESET on windows, which is not retried")
@@ -8888,60 +8894,179 @@ func Test_BlobStore_Push_RetriesSeekableBody(t *testing.T) {
 		Digest:    digest.FromBytes(blob),
 		Size:      int64(len(blob)),
 	}
-	uuid := "4fd53bc9-565d-4527-ab80-3e051ac4880c"
-	// the two PUT attempts are served on different connections, hence the atomic
-	var attempts atomic.Int32
-	var gotBlob []byte
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodPost:
-			w.Header().Set("Location", "/v2/test/blobs/uploads/"+uuid)
-			w.WriteHeader(http.StatusAccepted)
-		case r.Method == http.MethodPut:
-			if attempts.Add(1) == 1 {
-				// read part of the body, then reset the fresh connection
-				// instead of answering, which net/http does not retry on its own
-				_, _ = io.CopyN(io.Discard, r.Body, 5)
-				conn, _, err := w.(http.Hijacker).Hijack()
+
+	tests := []struct {
+		name    string
+		content func(t *testing.T) io.Reader
+	}{
+		{
+			name:    "non-closer seekable reader",
+			content: func(*testing.T) io.Reader { return readSeekerOnly{bytes.NewReader(blob)} },
+		},
+		{
+			// an *os.File is a seekable io.ReadCloser, matching what the oci and
+			// file stores return from Fetch; the transport closes it after each
+			// attempt, so a replay must not seek the closed file.
+			name: "file-backed read closer",
+			content: func(t *testing.T) io.Reader {
+				f, err := os.CreateTemp(t.TempDir(), "blob")
 				if err != nil {
-					t.Errorf("failed to hijack the connection: %v", err)
-					return
+					t.Fatalf("CreateTemp() error = %v", err)
 				}
-				// a zero linger makes Close send a RST instead of a FIN
-				if err := conn.(*net.TCPConn).SetLinger(0); err != nil {
-					t.Errorf("failed to set linger: %v", err)
+				if _, err := f.Write(blob); err != nil {
+					t.Fatalf("write temp blob error = %v", err)
 				}
-				conn.Close()
-				return
-			}
-			gotBlob, _ = io.ReadAll(r.Body)
-			w.Header().Set("Docker-Content-Digest", blobDesc.Digest.String())
-			w.WriteHeader(http.StatusCreated)
-		default:
-			w.WriteHeader(http.StatusForbidden)
-		}
-	}))
-	defer ts.Close()
-	uri, err := url.Parse(ts.URL)
-	if err != nil {
-		t.Fatalf("invalid test http server: %v", err)
+				if _, err := f.Seek(0, io.SeekStart); err != nil {
+					t.Fatalf("seek temp blob error = %v", err)
+				}
+				t.Cleanup(func() { f.Close() })
+				return f
+			},
+		},
 	}
 
-	repo, err := NewRepository(uri.Host + "/test")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uuid := "4fd53bc9-565d-4527-ab80-3e051ac4880c"
+			// the two PUT attempts are served on different connections, hence the atomic
+			var attempts atomic.Int32
+			var gotBlob []byte
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost:
+					w.Header().Set("Location", "/v2/test/blobs/uploads/"+uuid)
+					w.WriteHeader(http.StatusAccepted)
+				case r.Method == http.MethodPut:
+					if attempts.Add(1) == 1 {
+						// read part of the body, then reset the fresh connection
+						// instead of answering, which net/http does not retry on its own
+						_, _ = io.CopyN(io.Discard, r.Body, 5)
+						conn, _, err := w.(http.Hijacker).Hijack()
+						if err != nil {
+							t.Errorf("failed to hijack the connection: %v", err)
+							return
+						}
+						// a zero linger makes Close send a RST instead of a FIN
+						if err := conn.(*net.TCPConn).SetLinger(0); err != nil {
+							t.Errorf("failed to set linger: %v", err)
+						}
+						conn.Close()
+						return
+					}
+					gotBlob, _ = io.ReadAll(r.Body)
+					w.Header().Set("Docker-Content-Digest", blobDesc.Digest.String())
+					w.WriteHeader(http.StatusCreated)
+				default:
+					w.WriteHeader(http.StatusForbidden)
+				}
+			}))
+			defer ts.Close()
+			uri, err := url.Parse(ts.URL)
+			if err != nil {
+				t.Fatalf("invalid test http server: %v", err)
+			}
+
+			repo, err := NewRepository(uri.Host + "/test")
+			if err != nil {
+				t.Fatalf("NewRepository() error = %v", err)
+			}
+			repo.PlainHTTP = true
+			repo.Client = &auth.Client{Client: &http.Client{Transport: retry.NewTransport(http.DefaultTransport)}}
+
+			if err := repo.Blobs().Push(context.Background(), blobDesc, tt.content(t)); err != nil {
+				t.Fatalf("Blobs.Push() error = %v", err)
+			}
+			if n := attempts.Load(); n != 2 {
+				t.Errorf("PUT attempts = %d, want 2", n)
+			}
+			if !bytes.Equal(gotBlob, blob) {
+				t.Errorf("received blob = %q, want %q", gotBlob, blob)
+			}
+		})
+	}
+}
+
+// Test_BlobStore_Push_GetBody_ConcurrentReplay verifies that, for a ReaderAt
+// source (e.g. the *os.File the oci/file stores return), the request body and
+// every GetBody replay are independent readers over the shared source. A failed
+// attempt still reading must not race a retry's replay. Meaningful under -race:
+// the previous single-shared-seeker wiring would race here.
+func Test_BlobStore_Push_GetBody_ConcurrentReplay(t *testing.T) {
+	blob := []byte("hello world, a ReaderAt-backed seekable blob payload")
+	blobDesc := ocispec.Descriptor{
+		MediaType: "test",
+		Digest:    digest.FromBytes(blob),
+		Size:      int64(len(blob)),
+	}
+
+	f, err := os.CreateTemp(t.TempDir(), "blob")
+	if err != nil {
+		t.Fatalf("CreateTemp() error = %v", err)
+	}
+	defer f.Close()
+	if _, err := f.Write(blob); err != nil {
+		t.Fatalf("write temp blob error = %v", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatalf("seek temp blob error = %v", err)
+	}
+
+	uuid := "4fd53bc9-565d-4527-ab80-3e051ac4880c"
+	var putReq *http.Request
+	client := &auth.Client{Client: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		resp := &http.Response{Request: req, Header: http.Header{}, Body: http.NoBody}
+		switch {
+		case req.Method == http.MethodPost:
+			resp.StatusCode = http.StatusAccepted
+			resp.Header.Set("Location", "/v2/test/blobs/uploads/"+uuid)
+		case req.Method == http.MethodPut:
+			putReq = req
+			resp.StatusCode = http.StatusCreated
+			resp.Header.Set("Docker-Content-Digest", blobDesc.Digest.String())
+		default:
+			resp.StatusCode = http.StatusForbidden
+		}
+		return resp, nil
+	})}}
+
+	repo, err := NewRepository("registry.example.com/test")
 	if err != nil {
 		t.Fatalf("NewRepository() error = %v", err)
 	}
 	repo.PlainHTTP = true
-	repo.Client = &auth.Client{Client: &http.Client{Transport: retry.NewTransport(http.DefaultTransport)}}
+	repo.Client = client
 
-	content := readSeekerOnly{bytes.NewReader(blob)}
-	if err := repo.Blobs().Push(context.Background(), blobDesc, content); err != nil {
+	if err := repo.Blobs().Push(context.Background(), blobDesc, f); err != nil {
 		t.Fatalf("Blobs.Push() error = %v", err)
 	}
-	if n := attempts.Load(); n != 2 {
-		t.Errorf("PUT attempts = %d, want 2", n)
+	if putReq == nil || putReq.GetBody == nil || putReq.Body == nil {
+		t.Fatal("GetBody/Body not set for a ReaderAt source")
 	}
-	if !bytes.Equal(gotBlob, blob) {
-		t.Errorf("received blob = %q, want %q", gotBlob, blob)
+
+	// Read the first-attempt body alongside several replays, concurrently.
+	readers := []io.Reader{putReq.Body}
+	for range 4 {
+		rc, err := putReq.GetBody()
+		if err != nil {
+			t.Fatalf("GetBody() error = %v", err)
+		}
+		defer rc.Close()
+		readers = append(readers, rc)
 	}
+	var wg sync.WaitGroup
+	for _, r := range readers {
+		wg.Add(1)
+		go func(r io.Reader) {
+			defer wg.Done()
+			got, err := io.ReadAll(r)
+			if err != nil {
+				t.Errorf("read error = %v", err)
+				return
+			}
+			if !bytes.Equal(got, blob) {
+				t.Errorf("replay = %q, want %q", got, blob)
+			}
+		}(r)
+	}
+	wg.Wait()
 }
